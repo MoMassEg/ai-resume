@@ -1,0 +1,379 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type User struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password,omitempty"` // omit in JSON response
+	Role     string `json:"role"`
+}
+
+type Resume struct {
+	ID         string `json:"id"`
+	UserID     string `json:"userId"`
+	Name       string `json:"name"`
+	Job        string `json:"job"`
+	Skills     string `json:"skills"`
+	Experience string `json:"experience"`
+	FileName   string `json:"fileName"`
+}
+
+var DB *pgx.Conn
+
+// ================== DB Connection ==================
+func connectDB() {
+	var err error
+	dsn := "postgres://postgres:m7mdndgamer@localhost:5432/postgres"
+	DB, err = pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		log.Fatalf("❌ Cannot connect to DB: %v", err)
+	}
+	fmt.Println("✅ Connected to PostgreSQL!")
+
+	// Create tables if not exists
+	createUsersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL,
+		role TEXT NOT NULL DEFAULT 'user'
+	);`
+	_, err = DB.Exec(context.Background(), createUsersTable)
+	if err != nil {
+		log.Fatalf("❌ Error creating users table: %v", err)
+	}
+
+	createResumesTable := `
+	CREATE TABLE IF NOT EXISTS resumes (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		job TEXT NOT NULL,
+		skills TEXT,
+		experience TEXT,
+		file_name TEXT,
+		content TEXT,
+		date TIMESTAMP NOT NULL
+	);`
+	_, err = DB.Exec(context.Background(), createResumesTable)
+	if err != nil {
+		log.Fatalf("❌ Error creating resumes table: %v", err)
+	}
+}
+
+// ================== Middleware ==================
+func enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ================== Auth Handlers ==================
+func registerUser(w http.ResponseWriter, r *http.Request) {
+	var u User
+	json.NewDecoder(r.Body).Decode(&u)
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Password hashing failed", 500)
+		return
+	}
+
+	err = DB.QueryRow(context.Background(),
+		"INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id",
+		u.Name, u.Email, string(hashed), u.Role).Scan(&u.ID)
+
+	if err != nil {
+		http.Error(w, "Email already exists or error saving", 400)
+		return
+	}
+
+	u.Password = ""
+	json.NewEncoder(w).Encode(u)
+}
+
+func loginUser(w http.ResponseWriter, r *http.Request) {
+	var input User
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, `{"error":"Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	if input.Email == "" || input.Password == "" {
+		http.Error(w, `{"error":"Email and password are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var dbUser User
+	err := DB.QueryRow(context.Background(),
+		"SELECT id, name, email, password, role FROM users WHERE email=$1",
+		input.Email).Scan(&dbUser.ID, &dbUser.Name, &dbUser.Email, &dbUser.Password, &dbUser.Role)
+
+	if err != nil {
+		http.Error(w, `{"error":"Email not found"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(input.Password)); err != nil {
+		http.Error(w, `{"error":"Incorrect password"}`, http.StatusBadRequest)
+		return
+	}
+
+	dbUser.Password = ""
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Login successful",
+		"user":    map[string]interface{}{"id": dbUser.ID},
+	})
+}
+
+func getUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := DB.Query(context.Background(), "SELECT id, name, email, role FROM users")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.Role); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		users = append(users, u)
+	}
+	json.NewEncoder(w).Encode(users)
+}
+
+func deleteUser(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	_, err := DB.Exec(context.Background(), "DELETE FROM users WHERE id=$1", id)
+	if err != nil {
+		http.Error(w, "Delete failed", 500)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "🗑️ User %s deleted", id)
+}
+
+func updateUser(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var u User
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+		http.Error(w, "Invalid input", 400)
+		return
+	}
+
+	_, err := DB.Exec(context.Background(),
+		"UPDATE users SET name=$1, email=$2, role=$3 WHERE id=$4",
+		u.Name, u.Email, u.Role, id)
+
+	if err != nil {
+		http.Error(w, "Update failed", 500)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "✅ User %s updated successfully", id)
+}
+
+func getUserByID(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var u User
+	err := DB.QueryRow(context.Background(),
+		"SELECT id, name, email, role FROM users WHERE id=$1", id).
+		Scan(&u.ID, &u.Name, &u.Email, &u.Role)
+
+	if err != nil {
+		http.Error(w, "User not found", 404)
+		return
+	}
+	json.NewEncoder(w).Encode(u)
+}
+
+// ================== Resume Generator API ==================
+func createResume(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID     string `json:"userId"`
+		Name       string `json:"name"`
+		Job        string `json:"job"`
+		Skills     string `json:"skills"`
+		Experience string `json:"experience"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", 400)
+		return
+	}
+
+	// Call Python API
+	payload, _ := json.Marshal(map[string]string{
+		"name":       req.Name,
+		"job":        req.Job,
+		"skills":     req.Skills,
+		"experience": req.Experience,
+	})
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post("http://localhost:7001/generate_resume", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		http.Error(w, "Failed to call Python API", 500)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var pyResp struct {
+		Id string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &pyResp); err != nil {
+		http.Error(w, "Invalid Python API response", 500)
+		return
+	}
+
+	// Store in DB
+	newID := fmt.Sprintf("%d", time.Now().UnixNano())
+	_, err = DB.Exec(context.Background(),
+		`INSERT INTO resumes (id, user_id, name, job, skills, experience, file_name, date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		newID, req.UserID, req.Name, req.Job, req.Skills, req.Experience, pyResp.Id, time.Now().UTC())
+
+	if err != nil {
+		http.Error(w, "DB insert failed", 500)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"fileName": pyResp.Id,
+	})
+}
+
+// ================== Resume Handlers ==================
+func getResumesByUser(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("userId")
+	if err != nil {
+		http.Error(w, "User not logged in", 401)
+		return
+	}
+	userId := cookie.Value
+
+	rows, err := DB.Query(context.Background(),
+		"SELECT id, user_id, name, job, skills, experience, file_name FROM resumes WHERE user_id=$1 ORDER BY date DESC", userId)
+	if err != nil {
+		http.Error(w, "DB query failed", 500)
+		return
+	}
+	defer rows.Close()
+
+	var resumes []Resume
+	for rows.Next() {
+		var r Resume
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Name, &r.Job, &r.Skills, &r.Experience, &r.FileName); err != nil {
+			http.Error(w, "Row scan failed", 500)
+			return
+		}
+		resumes = append(resumes, r)
+	}
+	json.NewEncoder(w).Encode(resumes)
+}
+
+func deleteResume(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	_, err := DB.Exec(context.Background(), "DELETE FROM resumes WHERE id=$1", id)
+	if err != nil {
+		http.Error(w, "Delete failed", 500)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "🗑️ Resume %s deleted", id)
+}
+
+func downloadResume(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var fileName string
+	err := DB.QueryRow(context.Background(),
+		"SELECT file_name FROM resumes WHERE id=$1", id).Scan(&fileName)
+	if err != nil {
+		http.Error(w, "Resume not found", 404)
+		return
+	}
+
+	// Assuming resumes are stored in ./resumes/
+	filePath := fmt.Sprintf("./resumes/%s.docx", fileName)
+	http.ServeFile(w, r, filePath)
+}
+func getAllResumes(w http.ResponseWriter, r *http.Request) {
+	rows, err := DB.Query(context.Background(),
+		"SELECT id, user_id, name, job, skills, experience, file_name FROM resumes ORDER BY date DESC")
+	if err != nil {
+		http.Error(w, "DB query failed", 500)
+		return
+	}
+	defer rows.Close()
+
+	var resumes []Resume
+	for rows.Next() {
+		var r Resume
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Name, &r.Job, &r.Skills, &r.Experience, &r.FileName); err != nil {
+			http.Error(w, "Row scan failed", 500)
+			return
+		}
+		resumes = append(resumes, r)
+	}
+
+	json.NewEncoder(w).Encode(resumes)
+}
+
+// ================== Main ==================
+func main() {
+	connectDB()
+
+	r := mux.NewRouter()
+	r.Use(enableCORS)
+
+	// User routes
+	r.HandleFunc("/register", registerUser).Methods("POST", "OPTIONS")
+	r.HandleFunc("/login", loginUser).Methods("POST", "OPTIONS")
+	r.HandleFunc("/users", getUsers).Methods("GET", "OPTIONS")
+	r.HandleFunc("/users/{id}", getUserByID).Methods("GET", "OPTIONS")
+	r.HandleFunc("/users/{id}", updateUser).Methods("PUT", "OPTIONS")
+	r.HandleFunc("/users/{id}", deleteUser).Methods("DELETE", "OPTIONS")
+
+	// Resume route
+	r.HandleFunc("/resumes", createResume).Methods("POST", "OPTIONS")
+	r.HandleFunc("/resumes/user", getResumesByUser).Methods("GET", "OPTIONS")
+	r.HandleFunc("/resumes/all", getAllResumes).Methods("GET", "OPTIONS")
+	r.HandleFunc("/resumes/{id}", deleteResume).Methods("DELETE", "OPTIONS")
+	r.HandleFunc("/resumes/download/{id}", downloadResume).Methods("GET", "OPTIONS")
+
+	fmt.Println("🚀 Server running at http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", r))
+}
